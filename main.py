@@ -31,14 +31,12 @@ logging.basicConfig(
 ONBOARD_LANG = "onb_lang"
 ONBOARD_CITY = "onb_city"
 BROADCAST_MODE = "broadcast_mode"
+BROADCAST_PREVIEW = "broadcast_preview"
 
-# Максимальное отклонение для "опоздавших" напоминаний (в секундах)
-LATE_WINDOW_SECONDS = 120  # 2 минуты
+LATE_WINDOW_SECONDS = 120
 
 # ---------------- PATHS ----------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Railway Volume directory (persistent storage)
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -90,7 +88,6 @@ def save_users():
             if os.path.exists(temp_file):
                 os.remove(temp_file)
 
-# ---------------- TRACKER (очищенный) ----------------
 def load_tracker():
     """Загружает трекер, очищая старые записи"""
     with tracker_lock:
@@ -101,20 +98,17 @@ def load_tracker():
             with open(TRACKER_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             
-            # Очищаем записи старше 2 дней
             today = datetime.now(ZoneInfo("Asia/Tashkent")).strftime("%Y-%m-%d")
             yesterday = (datetime.now(ZoneInfo("Asia/Tashkent")) - timedelta(days=1)).strftime("%Y-%m-%d")
             
             cleaned = {}
             for key, value in data.items():
-                # key format: user123_iftar_2026-02-26
                 parts = key.split("_")
                 if len(parts) >= 3:
                     date_part = parts[-1]
                     if date_part in [today, yesterday]:
                         cleaned[key] = value
             
-            # Сохраняем очищенный трекер
             with open(TRACKER_FILE, "w", encoding="utf-8") as f:
                 json.dump(cleaned, f, ensure_ascii=False, indent=2)
             
@@ -183,11 +177,12 @@ def update_activity(user_obj, uid):
     })
     save_users()
 
-def save_user_data(user_obj, uid):
+def save_user_data(user_obj, uid, is_new=False):
     """Создает или обновляет пользователя"""
     uid = str(uid)
     tashkent_tz = ZoneInfo("Asia/Tashkent")
-    now = datetime.now(tashkent_tz).strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now(tashkent_tz)
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
     
     if uid not in users:
         users[uid] = {
@@ -196,15 +191,15 @@ def save_user_data(user_obj, uid):
             "remind_min": 10,
             "first_name": user_obj.first_name,
             "username": user_obj.username,
-            "joined": now,
-            "last_active": now,
+            "joined": now_str,
+            "last_active": now_str,
             "push_sent": False
         }
     else:
         users[uid].update({
             "first_name": user_obj.first_name,
             "username": user_obj.username,
-            "last_active": now
+            "last_active": now_str
         })
     
     save_users()
@@ -215,6 +210,13 @@ def t(uid, key):
     uid = str(uid)
     lang = users.get(uid, {}).get("lang", "uz")
     
+    text = TEXTS.get(lang, TEXTS["uz"]).get(key)
+    if text is None:
+        text = TEXTS["uz"].get(key, TEXTS["ru"].get(key, key))
+    return text
+
+def get_text_by_lang(lang, key):
+    """Получает текст на конкретном языке (для onboarding)"""
     text = TEXTS.get(lang, TEXTS["uz"]).get(key)
     if text is None:
         text = TEXTS["uz"].get(key, TEXTS["ru"].get(key, key))
@@ -250,6 +252,19 @@ def format_pretty_date(dt, uid):
     month = months[dt.month - 1]
     return f"{dt.day} {month} {dt.year}"
 
+def get_city_name(city, lang):
+    """Возвращает название города на нужном языке"""
+    names = {
+        "tashkent": {"uz": "Tashkent 🇺🇿", "ru": "Ташкент 🇺🇿"},
+        "bremen": {"uz": "Bremen 🇩🇪", "ru": "Бремен 🇩🇪"}
+    }
+    return names.get(city, {}).get(lang, city)
+
+def get_lang_name(lang):
+    """Возвращает название языка"""
+    names = {"uz": "O'zbekcha 🇺🇿", "ru": "Русский 🇷🇺"}
+    return names.get(lang, lang)
+
 # ---------------- KEYBOARDS ----------------
 def main_kb(uid):
     """Главная клавиатура"""
@@ -258,7 +273,11 @@ def main_kb(uid):
             InlineKeyboardButton(t(uid, "today"), callback_data="day_today"),
             InlineKeyboardButton(t(uid, "tomorrow"), callback_data="day_tomorrow")
         ],
-        [InlineKeyboardButton(t(uid, "countdown"), callback_data="run_countdown")],
+        [
+            InlineKeyboardButton(t(uid, "countdown_iftar"), callback_data="run_countdown_iftar"),
+            InlineKeyboardButton(t(uid, "countdown_suhoor"), callback_data="run_countdown_suhoor")
+        ],
+        [InlineKeyboardButton(t(uid, "my_settings"), callback_data="show_settings")],
         [InlineKeyboardButton(t(uid, "settings"), callback_data="menu_settings")]
     ])
 
@@ -277,7 +296,9 @@ def admin_kb():
     """Админская клавиатура"""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👥 Пользователи", callback_data="admin_users_0")],
+        [InlineKeyboardButton("🔍 Найти пользователя", callback_data="admin_search")],
         [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton("📈 Рост бота", callback_data="admin_growth")],
         [InlineKeyboardButton("🔔 Напоминания", callback_data="admin_remind_stats")],
         [InlineKeyboardButton("📢 Рассылка", callback_data="admin_broadcast")]
     ])
@@ -288,13 +309,22 @@ def cancel_broadcast_kb():
         [InlineKeyboardButton("❌ Отменить рассылку", callback_data="cancel_broadcast")]
     ])
 
+def confirm_broadcast_kb():
+    """Клавиатура подтверждения рассылки"""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Отправить всем", callback_data="confirm_broadcast"),
+            InlineKeyboardButton("❌ Отмена", callback_data="cancel_broadcast")
+        ]
+    ])
+
 # ---------------- COMMANDS ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start"""
+    """Обработчик команды /start с onboarding"""
     uid = str(update.effective_chat.id)
     user_obj = update.effective_user
     
-    # Существующий пользователь - обновляем активность
+    # Существующий пользователь
     if uid in users:
         update_activity(user_obj, uid)
         await update.message.reply_text(
@@ -303,12 +333,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Проверяем, не идет ли уже onboarding
+    # Проверяем onboarding
     if context.user_data.get("onboarding"):
-        await update.message.reply_text(t(uid, "onboarding_in_progress"))
+        await update.message.reply_text(
+            "⚙️ Ro'yxatdan o'tish davom etmoqda. Iltimos, tanlovni yakunlang.\n\n"
+            "⚙️ Регистрация уже начата. Пожалуйста, завершите выбор."
+        )
         return
     
-    # Новый пользователь - начинаем onboarding
+    # Новый пользователь - начинаем onboarding с выбора языка
     context.user_data["onboarding"] = ONBOARD_LANG
     
     kb = InlineKeyboardMarkup([
@@ -327,7 +360,6 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /today"""
     uid = str(update.effective_chat.id)
     
-    # Регистрируем или обновляем пользователя
     if uid not in users:
         save_user_data(update.effective_user, uid)
     else:
@@ -358,7 +390,6 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /settings"""
     uid = str(update.effective_chat.id)
     
-    # Регистрируем или обновляем пользователя
     if uid not in users:
         save_user_data(update.effective_user, uid)
     else:
@@ -374,76 +405,40 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     
-    # Проверяем, не в режиме ли уже рассылка
-    if context.user_data.get(BROADCAST_MODE):
+    if context.user_data.get(BROADCAST_MODE) or context.user_data.get(BROADCAST_PREVIEW):
         await update.message.reply_text(
-            "❌ Вы уже в режиме рассылки. Отправьте сообщение или нажмите «Отменить».",
+            "❌ Вы уже в режиме рассылки. Завершите текущую операцию или отмените.",
             reply_markup=cancel_broadcast_kb()
         )
         return
     
-    # Проверяем аргументы
     msg = " ".join(context.args)
     
     if not msg:
-        # Нет аргументов - входим в интерактивный режим с кнопкой отмены
         context.user_data[BROADCAST_MODE] = True
         await update.message.reply_text(
             "📢 РЕЖИМ РАССЫЛКИ\n\n"
-            "Отправьте текст сообщения, и оно будет разослано всем пользователям.\n"
-            "Или нажмите «Отменить рассылку» для выхода из режима.",
+            "Отправьте текст сообщения для предпросмотра.\n"
+            "Или нажмите «Отменить рассылку» для выхода.",
             reply_markup=cancel_broadcast_kb()
         )
         return
     
-    # Есть аргументы - мгновенная рассылка
-    await send_broadcast(update, context, msg)
-
-async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, msg: str):
-    """Выполняет рассылку сообщения всем пользователям"""
-    sent = 0
-    failed = 0
-    total = len(users)
-    
-    status_message = await update.message.reply_text(
-        f"⏳ Начинаю рассылку...\nВсего пользователей: {total}"
+    context.user_data[BROADCAST_PREVIEW] = msg
+    await update.message.reply_text(
+        f"📢 ПРЕДПРОСМОТР РАССЫЛКИ\n\n"
+        f"Сообщение:\n{'─' * 30}\n{msg}\n{'─' * 30}\n\n"
+        f"👥 Получателей: {len(users)}",
+        reply_markup=confirm_broadcast_kb()
     )
-    
-    for uid in list(users.keys()):
-        try:
-            await context.bot.send_message(
-                chat_id=int(uid),
-                text=f"📢 {msg}"
-            )
-            sent += 1
-            if sent % 10 == 0:
-                await status_message.edit_text(
-                    f"⏳ Рассылка идет...\n"
-                    f"Отправлено: {sent}/{total}\n"
-                    f"Ошибок: {failed}"
-                )
-            await asyncio.sleep(0.05)
-        except Exception as e:
-            failed += 1
-            logging.error(f"Ошибка отправки {uid}: {e}")
-    
-    await status_message.edit_text(
-        f"✅ Рассылка завершена!\n\n"
-        f"📤 Отправлено: {sent}\n"
-        f"❌ Ошибок: {failed}\n"
-        f"👥 Всего в базе: {total}"
-    )
-    
-    # Очищаем режим рассылки если был
-    context.user_data[BROADCAST_MODE] = False
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /admin"""
     if update.effective_user.id != ADMIN_ID:
         return
     
-    # Очищаем режим рассылки при входе в админку
     context.user_data[BROADCAST_MODE] = False
+    context.user_data[BROADCAST_PREVIEW] = None
     
     await update.message.reply_text(
         "🛠 Админ панель",
@@ -451,29 +446,79 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик сообщений в режиме рассылки"""
+    """Обработчик сообщений в режиме рассылки или поиска"""
     uid = str(update.effective_chat.id)
     
-    # Проверяем onboarding
     if context.user_data.get("onboarding"):
-        await update.message.reply_text(t(uid, "use_buttons"))
+        await update.message.reply_text(
+            "👇 Iltimos, tanlash uchun tugmalardan foydalaning.\n\n"
+            "👇 Пожалуйста, используйте кнопки для выбора."
+        )
         return
     
-    # Проверяем права админа и режим рассылки
     if update.effective_user.id != ADMIN_ID:
         return
     
-    if not context.user_data.get(BROADCAST_MODE):
+    if context.user_data.get("admin_search_mode"):
+        search_query = update.message.text.strip()
+        context.user_data["admin_search_mode"] = False
+        
+        found = None
+        search_lower = search_query.lower()
+        
+        for user_id, user_data in users.items():
+            username = user_data.get("username", "") or ""
+            if search_query == user_id or search_lower == f"@{username.lower()}":
+                found = (user_id, user_data)
+                break
+        
+        if not found:
+            for user_id, user_data in users.items():
+                first_name = user_data.get("first_name", "") or ""
+                if search_lower in first_name.lower():
+                    found = (user_id, user_data)
+                    break
+        
+        if found:
+            target_uid, user = found
+            info = (
+                "👤 НАЙДЕН ПОЛЬЗОВАТЕЛЬ\n\n"
+                f"🆔 ID: <code>{target_uid}</code>\n"
+                f"👤 Имя: {user.get('first_name', 'N/A')}\n"
+                f"🔗 Username: @{user.get('username', 'N/A')}\n"
+                f"🌐 Язык: {get_lang_name(user.get('lang', 'uz'))}\n"
+                f"🌍 Город: {get_city_name(user.get('city', 'tashkent'), user.get('lang', 'uz'))}\n"
+                f"🔔 Напоминание: {user.get('remind_min', 10)} мин\n"
+                f"📅 Регистрация: {user.get('joined', 'N/A')}\n"
+                f"⚡ Активность: {user.get('last_active', 'N/A')}"
+            )
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ В админ панель", callback_data="admin_back")]
+            ])
+            await update.message.reply_text(info, reply_markup=kb, parse_mode="HTML")
+        else:
+            await update.message.reply_text(
+                f"❌ Пользователь не найден: {search_query}\n\n"
+                f"Попробуйте ввести ID или @username",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⬅️ Назад", callback_data="admin_back")
+                ]])
+            )
         return
     
-    # Получаем сообщение для рассылки
-    msg = update.message.text
-    
-    # Выходим из режима рассылки ПЕРЕД отправкой
-    context.user_data[BROADCAST_MODE] = False
-    
-    # Выполняем рассылку
-    await send_broadcast(update, context, msg)
+    if context.user_data.get(BROADCAST_MODE):
+        msg = update.message.text
+        
+        context.user_data[BROADCAST_MODE] = False
+        context.user_data[BROADCAST_PREVIEW] = msg
+        
+        await update.message.reply_text(
+            f"📢 ПРЕДПРОСМОТР РАССЫЛКИ\n\n"
+            f"Сообщение:\n{'─' * 30}\n{msg}\n{'─' * 30}\n\n"
+            f"👥 Получателей: {len(users)}",
+            reply_markup=confirm_broadcast_kb()
+        )
+        return
 
 # ---------------- HANDLERS ----------------
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -482,23 +527,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(q.message.chat.id)
     await q.answer()
     
-    # Обработка отмены рассылки (для админа)
+    # Обработка отмены рассылки
     if q.data == "cancel_broadcast":
         if update.effective_user.id != ADMIN_ID:
             await q.answer("❌ Нет доступа", show_alert=True)
             return
         
-        if context.user_data.get(BROADCAST_MODE):
-            context.user_data[BROADCAST_MODE] = False
+        context.user_data[BROADCAST_MODE] = False
+        context.user_data[BROADCAST_PREVIEW] = None
+        context.user_data["admin_search_mode"] = False
+        
+        await q.edit_message_text(
+            "🛠 ГЛАВНОЕ МЕНЮ АДМИНА",
+            reply_markup=admin_kb()
+        )
+        return
+    
+    # Подтверждение рассылки
+    if q.data == "confirm_broadcast":
+        if update.effective_user.id != ADMIN_ID:
+            await q.answer("❌ Нет доступа", show_alert=True)
+            return
+        
+        msg = context.user_data.get(BROADCAST_PREVIEW)
+        if not msg:
             await q.edit_message_text(
-                "❌ Рассылка отменена.\n\nВозвращаюсь в админ панель...",
+                "❌ Сообщение не найдено. Начните заново.",
                 reply_markup=admin_kb()
             )
-        else:
-            await q.edit_message_text(
-                "🛠 ГЛАВНОЕ МЕНЮ АДМИНА",
-                reply_markup=admin_kb()
-            )
+            return
+        
+        context.user_data[BROADCAST_PREVIEW] = None
+        
+        await q.edit_message_text("⏳ Начинаю рассылку...")
+        await execute_broadcast(context, msg, q.message)
         return
     
     # Обновляем активность для существующих пользователей
@@ -507,31 +569,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # ========== ONBOARDING ==========
     
-    # Выбор языка при регистрации
+    # Выбор языка
     if q.data.startswith("onb_lang_"):
         if context.user_data.get("onboarding") != ONBOARD_LANG:
-            await q.answer(t(uid, "action_expired"), show_alert=True)
+            await q.answer("⚠️ Действие устарело. Начните заново.", show_alert=True)
             return
         
         lang = q.data.split("_")[2]
         context.user_data["new_lang"] = lang
         context.user_data["onboarding"] = ONBOARD_CITY
         
+        # Текст выбора города на выбранном языке
+        city_text = "Shaharni tanlang:" if lang == "uz" else "Выберите город:"
+        
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("Tashkent 🇺🇿", callback_data="onb_city_tashkent")],
             [InlineKeyboardButton("Bremen 🇩🇪", callback_data="onb_city_bremen")]
         ])
         
-        await q.edit_message_text(
-            "Shaharni tanlang / Выберите город:",
-            reply_markup=kb
-        )
+        await q.edit_message_text(city_text, reply_markup=kb)
         return
     
-    # Выбор города при регистрации
+    # Выбор города - завершение onboarding
     if q.data.startswith("onb_city_"):
         if context.user_data.get("onboarding") != ONBOARD_CITY:
-            await q.answer(t(uid, "action_expired"), show_alert=True)
+            await q.answer("⚠️ Действие устарело. Начните заново.", show_alert=True)
             return
         
         city = q.data.split("_")[2]
@@ -556,17 +618,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Очищаем onboarding
         context.user_data.clear()
         
+        # Показываем приветственное сообщение на выбранном языке + кнопки сразу
+        welcome_text = get_text_by_lang(lang, "welcome_message")
+        
+        # Создаем клавиатуру для нового пользователя на его языке
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(get_text_by_lang(lang, "today"), callback_data="day_today"),
+                InlineKeyboardButton(get_text_by_lang(lang, "tomorrow"), callback_data="day_tomorrow")
+            ],
+            [
+                InlineKeyboardButton(get_text_by_lang(lang, "countdown_iftar"), callback_data="run_countdown_iftar"),
+                InlineKeyboardButton(get_text_by_lang(lang, "countdown_suhoor"), callback_data="run_countdown_suhoor")
+            ],
+            [InlineKeyboardButton(get_text_by_lang(lang, "my_settings"), callback_data="show_settings")],
+            [InlineKeyboardButton(get_text_by_lang(lang, "settings"), callback_data="menu_settings")]
+        ])
+        
         await q.edit_message_text(
-            t(uid, "start"),
-            reply_markup=main_kb(uid)
+            welcome_text,
+            reply_markup=kb
         )
         return
     
     # ========== ОСНОВНОЙ ФУНКЦИОНАЛ ==========
-    
-    # Проверяем, что пользователь существует (для остальных кнопок)
     if uid not in users:
-        await q.edit_message_text(t(uid, "please_restart"))
+        await q.edit_message_text(
+            "👋 Добро пожаловать! Отправьте /start для начала работы.\n\n"
+            "👋 Xush kelibsiz! Ishni boshlash uchun /start yuboring."
+        )
         return
     
     tz = get_tz(uid)
@@ -574,8 +654,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     city = users[uid]["city"]
     times = get_city_times(city)
     
-    # Обратный отсчет до ифтара
-    if q.data == "run_countdown":
+    # Мои настройки
+    if q.data == "show_settings":
+        user = users[uid]
+        lang = user.get("lang", "uz")
+        city_code = user.get("city", "tashkent")
+        remind = user.get("remind_min", 10)
+        
+        text = (
+            f"⚙️ {t(uid, 'my_settings_title')}\n\n"
+            f"🌍 {t(uid, 'set_city_btn')}: {get_city_name(city_code, lang)}\n"
+            f"🌐 {t(uid, 'set_lang_btn')}: {get_lang_name(lang)}\n"
+            f"🔔 {t(uid, 'set_remind_btn')}: {remind} {t(uid, 'minute')}"
+        )
+        
+        await q.edit_message_text(text, reply_markup=main_kb(uid))
+        return
+    
+    # Обратный отсчёт до ифтара
+    if q.data == "run_countdown_iftar":
         today = now.strftime("%Y-%m-%d")
         if today not in times:
             await q.edit_message_text(t(uid, "no_data"), reply_markup=main_kb(uid))
@@ -600,6 +697,37 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{t(uid, 'iftar_left')}\n\n"
                 f"⏳ {hours} {t(uid, 'hour')} {minutes} {t(uid, 'minute')}\n"
                 f"🕰 {iftar_time}"
+            )
+        
+        await q.edit_message_text(text, reply_markup=main_kb(uid))
+        return
+    
+    # Обратный отсчёт до сухура
+    if q.data == "run_countdown_suhoor":
+        today = now.strftime("%Y-%m-%d")
+        if today not in times:
+            await q.edit_message_text(t(uid, "no_data"), reply_markup=main_kb(uid))
+            return
+        
+        suhoor_time = times[today]['suhoor']
+        suhoor_dt = datetime.strptime(
+            f"{today} {suhoor_time}", 
+            "%Y-%m-%d %H:%M"
+        ).replace(tzinfo=tz)
+        
+        diff = suhoor_dt - now
+        
+        if diff.total_seconds() <= 0:
+            text = t(uid, "suhoor_time_now")
+        else:
+            total_seconds = int(diff.total_seconds())
+            hours = total_seconds // 3600
+            minutes = (total_seconds % 3600) // 60
+            
+            text = (
+                f"{t(uid, 'suhoor_left')}\n\n"
+                f"⏳ {hours} {t(uid, 'hour')} {minutes} {t(uid, 'minute')}\n"
+                f"🕰 {suhoor_time}"
             )
         
         await q.edit_message_text(text, reply_markup=main_kb(uid))
@@ -640,7 +768,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Смена языка - меню
+    # Смена языка
     if q.data == "set_lang":
         kb = InlineKeyboardMarkup([
             [
@@ -654,7 +782,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Применение языка
     if q.data.startswith("lang_"):
         new_lang = q.data.split("_")[1]
         update_user(uid, lang=new_lang)
@@ -664,7 +791,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Смена города - меню
+    # Смена города
     if q.data == "set_city":
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("Tashkent 🇺🇿", callback_data="city_tashkent")],
@@ -676,7 +803,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Применение города
     if q.data.startswith("city_"):
         new_city = q.data.split("_")[1]
         update_user(uid, city=new_city)
@@ -686,7 +812,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Настройка напоминаний - меню
+    # Настройка напоминаний
     if q.data == "set_remind":
         current = users[uid].get("remind_min", 10)
         kb = InlineKeyboardMarkup([
@@ -712,7 +838,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Применение напоминания
     if q.data.startswith("rem_"):
         minutes = int(q.data.split("_")[1])
         update_user(uid, remind_min=minutes)
@@ -723,12 +848,62 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # ========== АДМИН ПАНЕЛЬ ==========
-    
     if not q.data.startswith("admin_"):
         return
     
     if update.effective_user.id != ADMIN_ID:
         await q.answer("❌ Нет доступа", show_alert=True)
+        return
+    
+    # Поиск пользователя
+    if q.data == "admin_search":
+        context.user_data["admin_search_mode"] = True
+        await q.edit_message_text(
+            "🔍 ПОИСК ПОЛЬЗОВАТЕЛЯ\n\n"
+            "Введите ID пользователя или @username\n"
+            "Например: <code>123456789</code> или <code>@username</code>",
+            parse_mode="HTML",
+            reply_markup=cancel_broadcast_kb()
+        )
+        return
+    
+    # Статистика роста
+    if q.data == "admin_growth":
+        total_users = len(users)
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        
+        new_today = sum(
+            1 for u in users.values() 
+            if u.get("joined", "").startswith(today_str)
+        )
+        
+        week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        new_week = sum(
+            1 for u in users.values() 
+            if u.get("joined", "") >= week_ago
+        )
+        
+        active_today = sum(
+            1 for u in users.values() 
+            if u.get("last_active", "").startswith(today_str)
+        )
+        
+        conversion = (active_today/total_users*100) if total_users > 0 else 0
+        
+        text = (
+            f"📈 СТАТИСТИКА РОСТА\n\n"
+            f"👥 Всего пользователей: {total_users}\n"
+            f"🔥 Активны сегодня: {active_today}\n"
+            f"📈 Новые сегодня: {new_today}\n"
+            f"📈 Новые за 7 дней: {new_week}\n\n"
+            f"📊 Конверсия активности: {conversion:.1f}%"
+        )
+        
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ В меню админа", callback_data="admin_back")]
+        ])
+        
+        await q.edit_message_text(text, reply_markup=kb)
         return
     
     # Список пользователей с пагинацией
@@ -756,7 +931,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             ])
         
-        # Навигация
         nav = []
         if page > 0:
             nav.append(
@@ -809,8 +983,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🆔 ID: <code>{target_uid}</code>\n"
             f"👤 Имя: {user.get('first_name', 'N/A')}\n"
             f"🔗 Username: @{user.get('username', 'N/A')}\n"
-            f"🌐 Язык: {user.get('lang', 'N/A')}\n"
-            f"🌍 Город: {user.get('city', 'N/A')}\n"
+            f"🌐 Язык: {get_lang_name(user.get('lang', 'uz'))}\n"
+            f"🌍 Город: {get_city_name(user.get('city', 'tashkent'), user.get('lang', 'uz'))}\n"
             f"🔔 Напоминание: {user.get('remind_min', 'N/A')} мин\n"
             f"📅 Регистрация: {user.get('joined', 'N/A')}\n"
             f"⚡ Активность: {user.get('last_active', 'N/A')}"
@@ -869,7 +1043,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(text, reply_markup=kb)
         return
     
-    # Статистика
+    # Общая статистика
     if q.data == "admin_stats":
         total_users = len(users)
         today_str = datetime.now().strftime("%Y-%m-%d")
@@ -897,12 +1071,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         for lang, count in sorted(lang_stats.items()):
             emoji = "🇷🇺" if lang == "ru" else "🇺🇿" if lang == "uz" else "🌐"
-            text += f"  {emoji} {lang}: {count}\n"
+            text += f"  {emoji} {get_lang_name(lang)}: {count}\n"
         
         text += "\n🌍 Города:\n"
         for city, count in sorted(city_stats.items()):
             emoji = "🇺🇿" if city == "tashkent" else "🇩🇪" if city == "bremen" else "🌍"
-            text += f"  {emoji} {city}: {count}\n"
+            text += f"  {emoji} {get_city_name(city, 'ru')}: {count}\n"
         
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("⬅️ В меню админа", callback_data="admin_back")]
@@ -914,11 +1088,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Рассылка
     if q.data == "admin_broadcast":
         context.user_data[BROADCAST_MODE] = True
+        context.user_data[BROADCAST_PREVIEW] = None
         
         await q.edit_message_text(
             "📢 РЕЖИМ РАССЫЛКИ\n\n"
-            "Отправьте текст сообщения, и оно будет разослано всем пользователям.\n"
-            "Или нажмите «Отменить рассылку» для выхода из режима.",
+            "Отправьте текст сообщения для предпросмотра.\n"
+            "Или нажмите «Отменить рассылку» для выхода.",
             reply_markup=cancel_broadcast_kb()
         )
         return
@@ -926,14 +1101,55 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Возврат в админ меню
     if q.data == "admin_back":
         context.user_data[BROADCAST_MODE] = False
+        context.user_data[BROADCAST_PREVIEW] = None
+        context.user_data["admin_search_mode"] = False
+        
         await q.edit_message_text(
             "🛠 ГЛАВНОЕ МЕНЮ АДМИНА", 
             reply_markup=admin_kb()
         )
         return
 
-# ---------------- SCHEDULER (исправленный) ----------------
+async def execute_broadcast(context: ContextTypes.DEFAULT_TYPE, msg: str, status_message=None):
+    """Выполняет рассылку сообщения всем пользователям"""
+    sent = 0
+    failed = 0
+    total = len(users)
+    
+    if status_message:
+        await status_message.edit_text(f"⏳ Начинаю рассылку...\nВсего пользователей: {total}")
+    else:
+        status_message = await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"⏳ Начинаю рассылку...\nВсего пользователей: {total}"
+        )
+    
+    for uid in list(users.keys()):
+        try:
+            await context.bot.send_message(
+                chat_id=int(uid),
+                text=f"📢 {msg}"
+            )
+            sent += 1
+            if sent % 10 == 0:
+                await status_message.edit_text(
+                    f"⏳ Рассылка идет...\n"
+                    f"Отправлено: {sent}/{total}\n"
+                    f"Ошибок: {failed}"
+                )
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            failed += 1
+            logging.error(f"Ошибка отправки {uid}: {e}")
+    
+    await status_message.edit_text(
+        f"✅ Рассылка завершена!\n\n"
+        f"📤 Отправлено: {sent}\n"
+        f"❌ Ошибок: {failed}\n"
+        f"👥 Всего в базе: {total}"
+    )
 
+# ---------------- SCHEDULER ----------------
 async def send_notification_with_retry(context: ContextTypes.DEFAULT_TYPE, uid: str, msg: str, event: str, date_str: str, max_retries: int = 3):
     """Отправка уведомления с повторными попытками при flood limit"""
     global notification_tracker
@@ -948,7 +1164,6 @@ async def send_notification_with_retry(context: ContextTypes.DEFAULT_TYPE, uid: 
                 parse_mode="HTML"
             )
             
-            # Помечаем как отправленное только после успеха
             mark_notification_sent(notification_tracker, uid, event, date_str)
             logging.info(f"✅ Напоминание {event} отправлено: {uid} (попытка {attempt + 1})")
             return True
@@ -957,18 +1172,15 @@ async def send_notification_with_retry(context: ContextTypes.DEFAULT_TYPE, uid: 
             error_str = str(e)
             
             if "RetryAfter" in error_str or "Flood control exceeded" in error_str:
-                # Извлекаем время ожидания
-                retry_after = 5  # дефолтное значение
+                retry_after = 5
                 
                 try:
                     if "RetryAfter" in error_str:
-                        # Парсим из ошибки python-telegram-bot
                         import re
                         match = re.search(r'RetryAfter\((\d+)\)', error_str)
                         if match:
                             retry_after = int(match.group(1))
                         else:
-                            # Пробуем найти retry_after в атрибутах исключения
                             if hasattr(e, 'retry_after'):
                                 retry_after = e.retry_after
                 except:
@@ -976,8 +1188,8 @@ async def send_notification_with_retry(context: ContextTypes.DEFAULT_TYPE, uid: 
                 
                 if attempt < max_retries - 1:
                     logging.warning(f"⏳ Flood limit для {uid}, ждём {retry_after}с (попытка {attempt + 1}/{max_retries})")
-                    await asyncio.sleep(retry_after + 1)  # +1 сек на всякий случай
-                    continue  # Пробуем ещё раз
+                    await asyncio.sleep(retry_after + 1)
+                    continue
                 else:
                     logging.error(f"❌ Исчерпаны попытки для {uid} после {max_retries} попыток")
                     return False
@@ -988,7 +1200,7 @@ async def send_notification_with_retry(context: ContextTypes.DEFAULT_TYPE, uid: 
     return False
 
 async def run_scheduler(context: ContextTypes.DEFAULT_TYPE):
-    """Планировщик напоминаний с защитой от пропусков и перезагрузок"""
+    """Планировщик напоминаний"""
     global notification_tracker
     
     tashkent_now = datetime.now(ZoneInfo("Asia/Tashkent"))
@@ -1007,7 +1219,6 @@ async def run_scheduler(context: ContextTypes.DEFAULT_TYPE):
         remind_min = prefs.get("remind_min", 10)
         
         for event in ["suhoor", "iftar"]:
-            # Проверяем, не отправлено ли уже
             if is_notification_sent(notification_tracker, uid, event, today):
                 continue
             
@@ -1020,15 +1231,11 @@ async def run_scheduler(context: ContextTypes.DEFAULT_TYPE):
             remind_dt_local = event_dt_local - timedelta(minutes=remind_min)
             remind_dt_utc = remind_dt_local.astimezone(ZoneInfo("UTC"))
             
-            # РАССТОЯНИЕ ДО ВРЕМЕНИ НАПОМИНАНИЯ (в секундах)
             time_until_remind = (remind_dt_utc - now_utc).total_seconds()
             
-            # СЛУЧАЙ 1: Время напоминания ещё НЕ наступило (в будущем)
-            # Планируем задачу в job_queue
             if time_until_remind > 0:
                 job_name = f"rem_{uid}_{event}_{today}"
                 
-                # Проверяем, нет ли уже такой задачи
                 if not context.job_queue.get_jobs_by_name(job_name):
                     pretty_date = format_pretty_date(now_local, uid)
                     msg = (
@@ -1054,8 +1261,6 @@ async def run_scheduler(context: ContextTypes.DEFAULT_TYPE):
                     
                     logging.info(f"📅 Запланировано {event} для {uid} ({city}) на {remind_dt_utc}")
             
-            # СЛУЧАЙ 2: Время напоминания УЖЕ прошло, но недавно (в окне LATE_WINDOW)
-            # Отправляем НЕМЕДЛЕННО (защита от перезагрузки/пропуска)
             elif -LATE_WINDOW_SECONDS <= time_until_remind <= 0:
                 logging.warning(f"⚠️ ОПОЗДАНИЕ: {event} для {uid} прошло {abs(time_until_remind):.0f}с назад, отправляем сейчас!")
                 
@@ -1068,14 +1273,10 @@ async def run_scheduler(context: ContextTypes.DEFAULT_TYPE):
                     f"<i>{t(uid, event+'_dua')}</i>"
                 )
                 
-                # Отправляем немедленно (не в очереди)
                 asyncio.create_task(
                     send_notification_with_retry(context, uid, msg, event, today)
                 )
-            
-            # СЛУЧАЙ 3: Время прошло давно (> LATE_WINDOW) - пропускаем
         
-        # Проверяем наступление времени события для поздравления
         for event in ["suhoor", "iftar"]:
             event_time = times[today][event]
             event_dt = datetime.strptime(
@@ -1084,7 +1285,6 @@ async def run_scheduler(context: ContextTypes.DEFAULT_TYPE):
             ).replace(tzinfo=tz)
             
             diff = (now_local - event_dt).total_seconds()
-            # Окно поздравления 2 минуты
             if 0 <= diff <= 120:
                 congrats_key = f"{event}_congrats_sent_{today}"
                 if not prefs.get(congrats_key):
@@ -1112,7 +1312,7 @@ async def run_scheduler(context: ContextTypes.DEFAULT_TYPE):
                         logging.error(f"Ошибка поздравления {uid}: {e}")
 
 async def send_scheduled_notification(context: ContextTypes.DEFAULT_TYPE):
-    """Отправка запланированного уведомления (из job_queue)"""
+    """Отправка запланированного уведомления"""
     job = context.job
     data = job.data
     
@@ -1121,7 +1321,6 @@ async def send_scheduled_notification(context: ContextTypes.DEFAULT_TYPE):
     date_str = data["date"]
     msg = data["msg"]
     
-    # Проверяем ещё раз, не отправлено ли уже (на случай перезагрузки)
     if is_notification_sent(notification_tracker, uid, event, date_str):
         logging.info(f"⏭ Пропускаем {event} для {uid} - уже отправлено")
         return
