@@ -15,6 +15,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.error import Forbidden
 
 from translations import TEXTS
 
@@ -265,6 +266,49 @@ def get_lang_name(lang):
     names = {"uz": "O'zbekcha 🇺🇿", "ru": "Русский 🇷🇺"}
     return names.get(lang, lang)
 
+# ---------------- NEW: BLOCK CHECK FUNCTIONS ----------------
+async def check_user_blocked(bot, user_id: int) -> bool:
+    """Проверяет, заблокировал ли пользователь бота"""
+    try:
+        await bot.send_chat_action(chat_id=user_id, action="typing")
+        return False
+    except Forbidden:
+        return True
+    except Exception:
+        return False
+
+async def update_users_block_status(context: ContextTypes.DEFAULT_TYPE):
+    """Обновляет статус блокировки для всех пользователей"""
+    blocked_count = 0
+    tashkent_tz = ZoneInfo("Asia/Tashkent")
+    
+    for uid in list(users.keys()):
+        try:
+            is_blocked = await check_user_blocked(context.bot, int(uid))
+            if is_blocked:
+                users[uid]["is_blocked"] = True
+                users[uid]["blocked_date"] = datetime.now(tashkent_tz).strftime("%Y-%m-%d %H:%M:%S")
+                blocked_count += 1
+            else:
+                if users[uid].get("is_blocked"):
+                    users[uid]["is_blocked"] = False
+                    users[uid]["unblocked_date"] = datetime.now(tashkent_tz).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception as e:
+            logging.error(f"Ошибка проверки пользователя {uid}: {e}")
+    
+    if blocked_count > 0:
+        save_users()
+        logging.info(f"Обнаружено {blocked_count} заблокировавших бота")
+    
+    return blocked_count
+
+def get_user_status_info(user_data: dict) -> tuple:
+    """Возвращает (эмодзи, текст_статуса, дата_блокировки)"""
+    if user_data.get("is_blocked"):
+        blocked_date = user_data.get("blocked_date", "неизвестно")
+        return "🔴", "Заблокировал бота", blocked_date
+    return "🟢", "Активен", None
+
 # ---------------- KEYBOARDS ----------------
 def main_kb(uid):
     """Главная клавиатура"""
@@ -295,13 +339,34 @@ def settings_kb(uid):
 def admin_kb():
     """Админская клавиатура"""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👥 Пользователи", callback_data="admin_users_0")],
+        [InlineKeyboardButton("👥 Пользователи", callback_data="admin_users_0_all")],
+        [InlineKeyboardButton("🔄 Проверить блокировки", callback_data="admin_check_blocks")],
         [InlineKeyboardButton("🔍 Найти пользователя", callback_data="admin_search")],
         [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
         [InlineKeyboardButton("📈 Рост бота", callback_data="admin_growth")],
         [InlineKeyboardButton("🔔 Напоминания", callback_data="admin_remind_stats")],
         [InlineKeyboardButton("📢 Рассылка", callback_data="admin_broadcast")]
     ])
+
+def admin_users_filter_kb(current_filter="all"):
+    """Клавиатура фильтров пользователей"""
+    filters_config = [
+        ("all", "👥 Все"),
+        ("active", "🟢 Не заблокированы"),
+        ("blocked", "🔴 Заблокировали")
+    ]
+    
+    buttons = []
+    row = []
+    for filter_key, filter_name in filters_config:
+        text = f"{'✅ ' if current_filter == filter_key else ''}{filter_name}"
+        row.append(InlineKeyboardButton(text, callback_data=f"admin_filter_{filter_key}"))
+    buttons.append(row)
+    
+    buttons.append([InlineKeyboardButton("🔄 Обновить статусы", callback_data="admin_check_blocks")])
+    buttons.append([InlineKeyboardButton("⬅️ В меню админа", callback_data="admin_back")])
+    
+    return InlineKeyboardMarkup(buttons)
 
 def cancel_broadcast_kb():
     """Клавиатура отмены рассылки"""
@@ -324,7 +389,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_chat.id)
     user_obj = update.effective_user
     
-    # Существующий пользователь
     if uid in users:
         update_activity(user_obj, uid)
         await update.message.reply_text(
@@ -333,7 +397,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Проверяем onboarding
     if context.user_data.get("onboarding"):
         await update.message.reply_text(
             "⚙️ Ro'yxatdan o'tish davom etmoqda. Iltimos, tanlovni yakunlang.\n\n"
@@ -341,7 +404,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Новый пользователь - начинаем onboarding с выбора языка
     context.user_data["onboarding"] = ONBOARD_LANG
     
     kb = InlineKeyboardMarkup([
@@ -481,8 +543,10 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         
         if found:
             target_uid, user = found
+            status_emoji, status_text, blocked_date = get_user_status_info(user)
+            
             info = (
-                "👤 НАЙДЕН ПОЛЬЗОВАТЕЛЬ\n\n"
+                f"{status_emoji} НАЙДЕН ПОЛЬЗОВАТЕЛЬ\n\n"
                 f"🆔 ID: <code>{target_uid}</code>\n"
                 f"👤 Имя: {user.get('first_name', 'N/A')}\n"
                 f"🔗 Username: @{user.get('username', 'N/A')}\n"
@@ -490,8 +554,12 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 f"🌍 Город: {get_city_name(user.get('city', 'tashkent'), user.get('lang', 'uz'))}\n"
                 f"🔔 Напоминание: {user.get('remind_min', 10)} мин\n"
                 f"📅 Регистрация: {user.get('joined', 'N/A')}\n"
-                f"⚡ Активность: {user.get('last_active', 'N/A')}"
+                f"⚡ Статус: {status_text}"
             )
+            
+            if blocked_date:
+                info += f"\n🔴 Дата блокировки: {blocked_date}"
+            
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("⬅️ В админ панель", callback_data="admin_back")]
             ])
@@ -520,6 +588,72 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
+# ---------------- NEW: SHOW USERS LIST FUNCTION ----------------
+async def show_users_list(q, context, page: int, filter_type: str = "all"):
+    """Показывает список пользователей с учетом фильтра"""
+    per_page = 15
+    
+    if filter_type == "active":
+        filtered_users = [(uid, data) for uid, data in users.items() if not data.get("is_blocked")]
+    elif filter_type == "blocked":
+        filtered_users = [(uid, data) for uid, data in users.items() if data.get("is_blocked")]
+    else:
+        filtered_users = list(users.items())
+    
+    total = len(filtered_users)
+    
+    start_idx = page * per_page
+    end_idx = start_idx + per_page
+    page_users = filtered_users[start_idx:end_idx]
+    
+    buttons = []
+    for user_id, user_data in page_users:
+        name = user_data.get("first_name", "User")
+        username = user_data.get("username", "")
+        status_emoji, _, _ = get_user_status_info(user_data)
+        
+        display = f"{status_emoji} {name}" + (f" (@{username})" if username else "")
+        buttons.append([
+            InlineKeyboardButton(
+                display[:64],
+                callback_data=f"admin_user_{user_id}_{page}_{filter_type}"
+            )
+        ])
+    
+    nav = []
+    if page > 0:
+        nav.append(
+            InlineKeyboardButton(
+                "⬅️ Назад", 
+                callback_data=f"admin_users_{page-1}_{filter_type}"
+            )
+        )
+    if end_idx < total:
+        nav.append(
+            InlineKeyboardButton(
+                "Вперед ➡️", 
+                callback_data=f"admin_users_{page+1}_{filter_type}"
+            )
+        )
+    
+    if nav:
+        buttons.append(nav)
+    
+    buttons.append([InlineKeyboardButton("🔧 Фильтры", callback_data=f"admin_filter_{filter_type}")])
+    buttons.append([
+        InlineKeyboardButton("⬅️ В меню админа", callback_data="admin_back")
+    ])
+    
+    filter_names = {"all": "Все", "active": "Не заблокированы", "blocked": "Заблокировали"}
+    current_filter_name = filter_names.get(filter_type, "Все")
+    
+    await q.edit_message_text(
+        f"👥 ПОЛЬЗОВАТЕЛИ (Страница {page+1}/{((total-1)//per_page)+1 if total > 0 else 1})\n"
+        f"Фильтр: {current_filter_name}\n"
+        f"Всего: {total}", 
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
 # ---------------- HANDLERS ----------------
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопок"""
@@ -527,7 +661,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(q.message.chat.id)
     await q.answer()
     
-    # Обработка отмены рассылки
     if q.data == "cancel_broadcast":
         if update.effective_user.id != ADMIN_ID:
             await q.answer("❌ Нет доступа", show_alert=True)
@@ -543,7 +676,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Подтверждение рассылки
     if q.data == "confirm_broadcast":
         if update.effective_user.id != ADMIN_ID:
             await q.answer("❌ Нет доступа", show_alert=True)
@@ -563,13 +695,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await execute_broadcast(context, msg, q.message)
         return
     
-    # Обновляем активность для существующих пользователей
     if uid in users:
         update_activity(update.effective_user, uid)
     
     # ========== ONBOARDING ==========
     
-    # Выбор языка
     if q.data.startswith("onb_lang_"):
         if context.user_data.get("onboarding") != ONBOARD_LANG:
             await q.answer("⚠️ Действие устарело. Начните заново.", show_alert=True)
@@ -579,7 +709,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["new_lang"] = lang
         context.user_data["onboarding"] = ONBOARD_CITY
         
-        # Текст выбора города на выбранном языке
         city_text = "Shaharni tanlang:" if lang == "uz" else "Выберите город:"
         
         kb = InlineKeyboardMarkup([
@@ -590,7 +719,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(city_text, reply_markup=kb)
         return
     
-    # Выбор города - завершение onboarding
     if q.data.startswith("onb_city_"):
         if context.user_data.get("onboarding") != ONBOARD_CITY:
             await q.answer("⚠️ Действие устарело. Начните заново.", show_alert=True)
@@ -599,7 +727,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         city = q.data.split("_")[2]
         lang = context.user_data.get("new_lang", "uz")
         
-        # Создаем пользователя
         tashkent_tz = ZoneInfo("Asia/Tashkent")
         now = datetime.now(tashkent_tz).strftime("%Y-%m-%d %H:%M:%S")
         
@@ -615,13 +742,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         save_users()
         
-        # Очищаем onboarding
         context.user_data.clear()
         
-        # Показываем приветственное сообщение на выбранном языке + кнопки сразу
         welcome_text = get_text_by_lang(lang, "welcome_message")
         
-        # Создаем клавиатуру для нового пользователя на его языке
         kb = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton(get_text_by_lang(lang, "today"), callback_data="day_today"),
@@ -654,7 +778,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     city = users[uid]["city"]
     times = get_city_times(city)
     
-    # Мои настройки
     if q.data == "show_settings":
         user = users[uid]
         lang = user.get("lang", "uz")
@@ -671,7 +794,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(text, reply_markup=main_kb(uid))
         return
     
-    # Обратный отсчёт до ифтара
     if q.data == "run_countdown_iftar":
         today = now.strftime("%Y-%m-%d")
         if today not in times:
@@ -702,7 +824,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(text, reply_markup=main_kb(uid))
         return
     
-    # Обратный отсчёт до сухура
     if q.data == "run_countdown_suhoor":
         today = now.strftime("%Y-%m-%d")
         if today not in times:
@@ -733,7 +854,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(text, reply_markup=main_kb(uid))
         return
     
-    # Сегодня / Завтра
     if q.data.startswith("day_"):
         target = now if q.data == "day_today" else now + timedelta(days=1)
         date_str = target.strftime("%Y-%m-%d")
@@ -752,7 +872,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(text, reply_markup=main_kb(uid))
         return
     
-    # Меню настроек
     if q.data == "menu_settings":
         await q.edit_message_text(
             t(uid, "settings_title"), 
@@ -760,7 +879,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Назад в главное меню
     if q.data == "back_main":
         await q.edit_message_text(
             t(uid, "start"), 
@@ -768,7 +886,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Смена языка
     if q.data == "set_lang":
         kb = InlineKeyboardMarkup([
             [
@@ -791,7 +908,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Смена города
     if q.data == "set_city":
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("Tashkent 🇺🇿", callback_data="city_tashkent")],
@@ -812,7 +928,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Настройка напоминаний
     if q.data == "set_remind":
         current = users[uid].get("remind_min", 10)
         kb = InlineKeyboardMarkup([
@@ -855,7 +970,101 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("❌ Нет доступа", show_alert=True)
         return
     
-    # Поиск пользователя
+    # Проверка блокировок
+    if q.data == "admin_check_blocks":
+        await q.edit_message_text("🔄 Проверяю статусы пользователей...\nЭто может занять некоторое время.")
+        blocked_count = await update_users_block_status(context)
+        
+        blocked_users = [uid for uid, data in users.items() if data.get("is_blocked")]
+        
+        text = (
+            f"✅ Проверка завершена!\n\n"
+            f"👥 Всего пользователей: {len(users)}\n"
+            f"🔴 Заблокировали бота: {len(blocked_users)}\n"
+            f"🟢 Активных: {len(users) - len(blocked_users)}"
+        )
+        
+        if blocked_users:
+            text += f"\n\n📋 Список заблокировавших ({min(10, len(blocked_users))} из {len(blocked_users)}):\n"
+            for uid in blocked_users[:10]:
+                user = users[uid]
+                date = user.get("blocked_date", "неизвестно")
+                name = user.get("first_name", "Unknown")
+                text += f"• {name} (ID: {uid}) - {date}\n"
+        
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("👥 Просмотреть пользователей", callback_data="admin_users_0_all")],
+            [InlineKeyboardButton("⬅️ В меню админа", callback_data="admin_back")]
+        ])
+        
+        await q.edit_message_text(text, reply_markup=kb)
+        return
+
+    # Фильтр пользователей
+    if q.data.startswith("admin_filter_"):
+        filter_type = q.data.split("_")[2]
+        context.user_data["admin_filter"] = filter_type
+        await show_users_list(q, context, 0, filter_type)
+        return
+
+    # Список пользователей с фильтрацией
+    if q.data.startswith("admin_users_"):
+        parts = q.data.split("_")
+        page = int(parts[2]) if len(parts) > 2 else 0
+        filter_type = parts[3] if len(parts) > 3 else "all"
+        
+        await show_users_list(q, context, page, filter_type)
+        return
+    
+    # Просмотр конкретного пользователя
+    if q.data.startswith("admin_user_"):
+        parts = q.data.split("_")
+        target_uid = parts[2]
+        back_page = parts[3] if len(parts) > 3 else "0"
+        back_filter = parts[4] if len(parts) > 4 else "all"
+        
+        user = users.get(target_uid)
+        if not user:
+            await q.edit_message_text(
+                "❌ Пользователь не найден", 
+                reply_markup=admin_kb()
+            )
+            return
+        
+        status_emoji, status_text, blocked_date = get_user_status_info(user)
+        
+        info = (
+            f"{status_emoji} ДЕТАЛИ ПОЛЬЗОВАТЕЛЯ\n\n"
+            f"🆔 ID: <code>{target_uid}</code>\n"
+            f"👤 Имя: {user.get('first_name', 'N/A')}\n"
+            f"🔗 Username: @{user.get('username', 'N/A')}\n"
+            f"🌐 Язык: {get_lang_name(user.get('lang', 'uz'))}\n"
+            f"🌍 Город: {get_city_name(user.get('city', 'tashkent'), user.get('lang', 'uz'))}\n"
+            f"🔔 Напоминание: {user.get('remind_min', 'N/A')} мин\n"
+            f"📅 Регистрация: {user.get('joined', 'N/A')}\n"
+            f"⚡ Последняя активность: {user.get('last_active', 'N/A')}\n"
+            f"📊 Статус: {status_text}"
+        )
+        
+        if blocked_date:
+            info += f"\n🔴 Дата блокировки: {blocked_date}"
+        
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "⬅️ Назад к списку", 
+                    callback_data=f"admin_users_{back_page}_{back_filter}"
+                )
+            ]
+        ])
+        
+        await q.edit_message_text(
+            info, 
+            reply_markup=kb, 
+            parse_mode="HTML"
+        )
+        return
+    
     if q.data == "admin_search":
         context.user_data["admin_search_mode"] = True
         await q.edit_message_text(
@@ -867,7 +1076,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Статистика роста
     if q.data == "admin_growth":
         total_users = len(users)
         today_str = datetime.now().strftime("%Y-%m-%d")
@@ -888,11 +1096,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if u.get("last_active", "").startswith(today_str)
         )
         
+        blocked_count = sum(1 for u in users.values() if u.get("is_blocked"))
+        
         conversion = (active_today/total_users*100) if total_users > 0 else 0
         
         text = (
             f"📈 СТАТИСТИКА РОСТА\n\n"
             f"👥 Всего пользователей: {total_users}\n"
+            f"🟢 Активных: {total_users - blocked_count}\n"
+            f"🔴 Заблокировали бота: {blocked_count}\n"
             f"🔥 Активны сегодня: {active_today}\n"
             f"📈 Новые сегодня: {new_today}\n"
             f"📈 Новые за 7 дней: {new_week}\n\n"
@@ -906,107 +1118,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(text, reply_markup=kb)
         return
     
-    # Список пользователей с пагинацией
-    if q.data.startswith("admin_users_"):
-        parts = q.data.split("_")
-        page = int(parts[2]) if len(parts) > 2 else 0
-        per_page = 15
-        
-        user_list = list(users.items())
-        total = len(user_list)
-        
-        start_idx = page * per_page
-        end_idx = start_idx + per_page
-        page_users = user_list[start_idx:end_idx]
-        
-        buttons = []
-        for user_id, user_data in page_users:
-            name = user_data.get("first_name", "User")
-            username = user_data.get("username", "")
-            display = f"👤 {name}" + (f" (@{username})" if username else "")
-            buttons.append([
-                InlineKeyboardButton(
-                    display[:64],
-                    callback_data=f"admin_user_{user_id}_{page}"
-                )
-            ])
-        
-        nav = []
-        if page > 0:
-            nav.append(
-                InlineKeyboardButton(
-                    "⬅️ Назад", 
-                    callback_data=f"admin_users_{page-1}"
-                )
-            )
-        if end_idx < total:
-            nav.append(
-                InlineKeyboardButton(
-                    "Вперед ➡️", 
-                    callback_data=f"admin_users_{page+1}"
-                )
-            )
-        
-        if nav:
-            buttons.append(nav)
-        
-        buttons.append([
-            InlineKeyboardButton(
-                "⬅️ В меню админа", 
-                callback_data="admin_back"
-            )
-        ])
-        
-        await q.edit_message_text(
-            f"👥 ПОЛЬЗОВАТЕЛИ (Страница {page+1}/{((total-1)//per_page)+1})\n"
-            f"Всего в базе: {total}", 
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-        return
-    
-    # Просмотр конкретного пользователя
-    if q.data.startswith("admin_user_"):
-        parts = q.data.split("_")
-        target_uid = parts[2]
-        back_page = parts[3] if len(parts) > 3 else "0"
-        
-        user = users.get(target_uid)
-        if not user:
-            await q.edit_message_text(
-                "❌ Пользователь не найден", 
-                reply_markup=admin_kb()
-            )
-            return
-        
-        info = (
-            "👤 ДЕТАЛИ ПОЛЬЗОВАТЕЛЯ\n\n"
-            f"🆔 ID: <code>{target_uid}</code>\n"
-            f"👤 Имя: {user.get('first_name', 'N/A')}\n"
-            f"🔗 Username: @{user.get('username', 'N/A')}\n"
-            f"🌐 Язык: {get_lang_name(user.get('lang', 'uz'))}\n"
-            f"🌍 Город: {get_city_name(user.get('city', 'tashkent'), user.get('lang', 'uz'))}\n"
-            f"🔔 Напоминание: {user.get('remind_min', 'N/A')} мин\n"
-            f"📅 Регистрация: {user.get('joined', 'N/A')}\n"
-            f"⚡ Активность: {user.get('last_active', 'N/A')}"
-        )
-        
-        kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "⬅️ Назад к списку", 
-                    callback_data=f"admin_users_{back_page}"
-                )
-            ]
-        ])
-        
-        await q.edit_message_text(
-            info, 
-            reply_markup=kb, 
-            parse_mode="HTML"
-        )
-        return
-    
-    # Статистика напоминаний
     if q.data == "admin_remind_stats":
         remind_stats = {5: 0, 10: 0, 15: 0, "other": 0}
         
@@ -1043,7 +1154,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(text, reply_markup=kb)
         return
     
-    # Общая статистика
     if q.data == "admin_stats":
         total_users = len(users)
         today_str = datetime.now().strftime("%Y-%m-%d")
@@ -1052,6 +1162,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             1 for u in users.values() 
             if u.get("last_active", "").startswith(today_str)
         )
+        
+        blocked_count = sum(1 for u in users.values() if u.get("is_blocked"))
         
         lang_stats = {}
         city_stats = {}
@@ -1065,6 +1177,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             f"📊 СТАТИСТИКА БОТА\n\n"
             f"👥 Всего пользователей: {total_users}\n"
+            f"🟢 Активных: {total_users - blocked_count}\n"
+            f"🔴 Заблокировали: {blocked_count}\n"
             f"🔥 Активны сегодня: {active_today}\n\n"
             f"🌐 Языки:\n"
         )
@@ -1085,7 +1199,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(text, reply_markup=kb)
         return
     
-    # Рассылка
     if q.data == "admin_broadcast":
         context.user_data[BROADCAST_MODE] = True
         context.user_data[BROADCAST_PREVIEW] = None
@@ -1098,7 +1211,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Возврат в админ меню
     if q.data == "admin_back":
         context.user_data[BROADCAST_MODE] = False
         context.user_data[BROADCAST_PREVIEW] = None
@@ -1114,6 +1226,7 @@ async def execute_broadcast(context: ContextTypes.DEFAULT_TYPE, msg: str, status
     """Выполняет рассылку сообщения всем пользователям"""
     sent = 0
     failed = 0
+    blocked = 0
     total = len(users)
     
     if status_message:
@@ -1124,6 +1237,8 @@ async def execute_broadcast(context: ContextTypes.DEFAULT_TYPE, msg: str, status
             text=f"⏳ Начинаю рассылку...\nВсего пользователей: {total}"
         )
     
+    tashkent_tz = ZoneInfo("Asia/Tashkent")
+    
     for uid in list(users.keys()):
         try:
             await context.bot.send_message(
@@ -1131,13 +1246,31 @@ async def execute_broadcast(context: ContextTypes.DEFAULT_TYPE, msg: str, status
                 text=f"📢 {msg}"
             )
             sent += 1
+            
+            # Если раньше был заблокирован, а сейчас отправилось - снимаем блокировку
+            if users[uid].get("is_blocked"):
+                users[uid]["is_blocked"] = False
+                users[uid]["unblocked_date"] = datetime.now(tashkent_tz).strftime("%Y-%m-%d %H:%M:%S")
+                save_users()
+            
             if sent % 10 == 0:
                 await status_message.edit_text(
                     f"⏳ Рассылка идет...\n"
                     f"Отправлено: {sent}/{total}\n"
+                    f"Заблокировали: {blocked}\n"
                     f"Ошибок: {failed}"
                 )
             await asyncio.sleep(0.05)
+            
+        except Forbidden:
+            blocked += 1
+            # Помечаем как заблокировавшего
+            if not users[uid].get("is_blocked"):
+                users[uid]["is_blocked"] = True
+                users[uid]["blocked_date"] = datetime.now(tashkent_tz).strftime("%Y-%m-%d %H:%M:%S")
+                save_users()
+            logging.warning(f"Пользователь {uid} заблокировал бота")
+            
         except Exception as e:
             failed += 1
             logging.error(f"Ошибка отправки {uid}: {e}")
@@ -1145,7 +1278,8 @@ async def execute_broadcast(context: ContextTypes.DEFAULT_TYPE, msg: str, status
     await status_message.edit_text(
         f"✅ Рассылка завершена!\n\n"
         f"📤 Отправлено: {sent}\n"
-        f"❌ Ошибок: {failed}\n"
+        f"🔴 Заблокировали: {blocked}\n"
+        f"❌ Других ошибок: {failed}\n"
         f"👥 Всего в базе: {total}"
     )
 
@@ -1155,6 +1289,7 @@ async def send_notification_with_retry(context: ContextTypes.DEFAULT_TYPE, uid: 
     global notification_tracker
     
     chat_id = int(uid)
+    tashkent_tz = ZoneInfo("Asia/Tashkent")
     
     for attempt in range(max_retries):
         try:
@@ -1164,9 +1299,24 @@ async def send_notification_with_retry(context: ContextTypes.DEFAULT_TYPE, uid: 
                 parse_mode="HTML"
             )
             
+            # Если отправилось успешно и раньше был заблокирован - снимаем статус
+            if users[uid].get("is_blocked"):
+                users[uid]["is_blocked"] = False
+                users[uid]["unblocked_date"] = datetime.now(tashkent_tz).strftime("%Y-%m-%d %H:%M:%S")
+                save_users()
+            
             mark_notification_sent(notification_tracker, uid, event, date_str)
             logging.info(f"✅ Напоминание {event} отправлено: {uid} (попытка {attempt + 1})")
             return True
+            
+        except Forbidden:
+            # Пользователь заблокировал бота
+            if not users[uid].get("is_blocked"):
+                users[uid]["is_blocked"] = True
+                users[uid]["blocked_date"] = datetime.now(tashkent_tz).strftime("%Y-%m-%d %H:%M:%S")
+                save_users()
+            logging.warning(f"Пользователь {uid} заблокировал бота (Forbidden)")
+            return False
             
         except Exception as e:
             error_str = str(e)
@@ -1208,6 +1358,10 @@ async def run_scheduler(context: ContextTypes.DEFAULT_TYPE):
     now_utc = datetime.now(ZoneInfo("UTC"))
     
     for uid, prefs in list(users.items()):
+        # Пропускаем заблокировавших пользователей
+        if prefs.get("is_blocked"):
+            continue
+            
         tz = get_tz(uid)
         now_local = datetime.now(tz)
         city = prefs.get("city", "tashkent")
@@ -1308,6 +1462,12 @@ async def run_scheduler(context: ContextTypes.DEFAULT_TYPE):
                         )
                         update_user(uid, **{congrats_key: True})
                         logging.info(f"🎉 Поздравление {event} для {uid}")
+                    except Forbidden:
+                        # Помечаем как заблокировавшего
+                        if not users[uid].get("is_blocked"):
+                            users[uid]["is_blocked"] = True
+                            users[uid]["blocked_date"] = datetime.now(ZoneInfo("Asia/Tashkent")).strftime("%Y-%m-%d %H:%M:%S")
+                            save_users()
                     except Exception as e:
                         logging.error(f"Ошибка поздравления {uid}: {e}")
 
